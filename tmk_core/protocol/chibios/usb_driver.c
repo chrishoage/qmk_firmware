@@ -25,6 +25,7 @@
 #include <hal.h>
 #include "usb_driver.h"
 #include <string.h>
+#include "print.h"
 
 /*===========================================================================*/
 /* Driver local definitions.                                                 */
@@ -255,6 +256,7 @@ void qmkusbStop(QMKUSBDriver *qmkusbp) {
  * @iclass
  */
 void qmkusbSuspendHookI(QMKUSBDriver *qmkusbp) {
+    print("qmkusbSuspendHookI");
     chnAddFlagsI(qmkusbp, CHN_DISCONNECTED);
     bqSuspendI(&qmkusbp->ibqueue);
     bqSuspendI(&qmkusbp->obqueue);
@@ -273,6 +275,7 @@ void qmkusbSuspendHookI(QMKUSBDriver *qmkusbp) {
  * @iclass
  */
 void qmkusbWakeupHookI(QMKUSBDriver *qmkusbp) {
+    print("qmkusbWakeupHookI");
     chnAddFlagsI(qmkusbp, CHN_CONNECTED);
     bqResumeX(&qmkusbp->ibqueue);
     bqResumeX(&qmkusbp->obqueue);
@@ -378,7 +381,7 @@ void qmkusbSOFHookI(QMKUSBDriver *qmkusbp) {
  * @param[in] ep        IN endpoint number
  */
 void qmkusbDataTransmitted(USBDriver *usbp, usbep_t ep) {
-    uint8_t *     buf;
+    uint8_t      *buf;
     size_t        n;
     QMKUSBDriver *qmkusbp = usbp->in_params[ep - 1U];
 
