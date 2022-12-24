@@ -2,3 +2,5 @@
 BOARD = QMK_PM2040
 
 SERIAL_DRIVER = vendor
+
+CONSOLE_ENABLE = yes

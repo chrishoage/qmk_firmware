@@ -9,28 +9,148 @@
 #endif // CONSOLE_ENABLE
 
 #ifdef ENCODER_ENABLE
-enum RightEncoderMode {
+enum EncoderMode {
     ENCODER_DEFAULT_DPI,
     ENCODER_SNIPING_DPI,
     _NUM_R_MODES,
-};
-
-enum LeftEncoderMode {
     ENCODER_VOLUME,
     _NUM_L_MODES,
 };
 
-static enum RightEncoderMode right_cur_mode = ENCODER_DEFAULT_DPI;
-static enum LeftEncoderMode  left_cur_mode  = ENCODER_VOLUME;
+#    define __ENC_L_START (_NUM_R_MODES + 1)
+#endif // ENCODER_ENABLE
+
+#if defined(ENCODER_ENABLE) || defined(POINTER_ENABLE)
+typedef union {
+    uint32_t raw;
+    struct {
+        uint8_t pointer_default_dpi : 4; // 16 steps available.
+        uint8_t pointer_sniping_dpi : 2; // 4 steps available.
+        uint8_t enc_modes[2];
+        bool    is_dragscroll_enabled : 1;
+        bool    is_sniping_enabled : 1;
+    } __attribute__((packed));
+} spleeb_config_t;
+
+static spleeb_config_t g_spleeb_config = {0};
+
+/**
+ * \brief Set the value of `config` from EEPROM.
+ *
+ * Note that `is_dragscroll_enabled` and `is_sniping_enabled` are purposefully
+ * ignored since we do not want to persist this state to memory.  In practice,
+ * this state is always written to maximize write-performances.  Therefore, we
+ * explicitly set them to `false` in this function.
+ */
+static void read_spleeb_config_from_eeprom(spleeb_config_t* config) {
+    config->raw                   = eeconfig_read_kb();
+    config->is_dragscroll_enabled = false;
+    config->is_sniping_enabled    = false;
+}
+
+/**
+ * \brief Save the value of `config` to eeprom.
+ *
+ * Note that all values are written verbatim, including whether drag-scroll
+ * and/or sniper mode are enabled.  `read_spleeb_config_from_eeprom(…)`
+ * resets these 2 values to `false` since it does not make sense to persist
+ * these across reboots of the board.
+ */
+static void write_spleeb_config_to_eeprom(spleeb_config_t* config) {
+    eeconfig_update_kb(config->raw);
+}
+
+void eeconfig_init_kb(void) {
+    g_spleeb_config.raw                 = 0;
+    g_spleeb_config.pointer_default_dpi = 4;
+    for (size_t i = 0; i < NUM_ENCODERS; i++) {
+        g_spleeb_config.enc_modes[i] = 0;
+    }
+
+    write_spleeb_config_to_eeprom(&g_spleeb_config);
+    eeconfig_init_user();
+}
+
+void matrix_init_kb(void) {
+    read_spleeb_config_from_eeprom(&g_spleeb_config);
+    matrix_init_user();
+}
+
+void spleeb_config_sync_handler(uint8_t initiator2target_buffer_size, const void* initiator2target_buffer, uint8_t target2initiator_buffer_size, void* target2initiator_buffer) {
+    if (initiator2target_buffer_size == sizeof(g_spleeb_config)) {
+        memcpy(&g_spleeb_config, initiator2target_buffer, sizeof(g_spleeb_config));
+    }
+}
+
+void keyboard_post_init_kb(void) {
+    debug_enable = true;
+    transaction_register_rpc(RPC_ID_KB_CONFIG_SYNC, spleeb_config_sync_handler);
+    keyboard_post_init_user();
+}
+
+void housekeeping_task_kb(void) {
+    if (is_keyboard_master()) {
+        // Keep track of the last state, so that we can tell if we need to propagate to slave.
+        static spleeb_config_t last_spleeb_config = {0};
+        static uint32_t        last_sync          = 0;
+        bool                   needs_sync         = false;
+
+        // Check if the state values are different.
+        if (memcmp(&g_spleeb_config, &last_spleeb_config, sizeof(g_spleeb_config))) {
+            needs_sync = true;
+            memcpy(&last_spleeb_config, &g_spleeb_config, sizeof(g_spleeb_config));
+        }
+        // Send to slave every 500ms regardless of state change.
+        if (timer_elapsed32(last_sync) > 500) {
+            needs_sync = true;
+        }
+
+        // Perform the sync if requested.
+        if (needs_sync) {
+            if (transaction_rpc_send(RPC_ID_KB_CONFIG_SYNC, sizeof(g_spleeb_config), &g_spleeb_config)) {
+                last_sync = timer_read32();
+            }
+        }
+    }
+    // No need to invoke the user-specific callback, as it's been called
+    // already.
+}
+#endif // defined(ENCODER_ENABLE) || defined(POINTER_ENABLE)
+
+#ifdef ENCODER_ENABLE
+static const char* get_encoder_mode_str(uint8_t mode) {
+    switch (mode) {
+        case ENCODER_DEFAULT_DPI:
+            return "dft dpi";
+        case ENCODER_SNIPING_DPI:
+            return "snp dpi";
+        case ENCODER_VOLUME:
+            return "volume";
+        default:
+            return get_u8_str(mode, ' ');
+    }
+}
+
+void step_spleeb_right_enc(spleeb_config_t* config) {
+    config->enc_modes[1] = (config->enc_modes[1] + 1) % _NUM_R_MODES;
+    write_spleeb_config_to_eeprom(config);
+}
+
+void step_spleeb_left_enc(spleeb_config_t* config) {
+    config->enc_modes[0] = __ENC_L_START + (((config->enc_modes[0] - __ENC_L_START) + 1) % (_NUM_L_MODES - __ENC_L_START));
+    write_spleeb_config_to_eeprom(config);
+}
 
 bool encoder_update_kb(uint8_t index, bool clockwise) {
     if (!encoder_update_user(index, clockwise)) {
         return false;
     }
 
+    uint8_t enc_mode = g_spleeb_config.enc_modes[index];
+
     switch (index) {
         case 0:
-            switch (left_cur_mode) {
+            switch (enc_mode) {
                 case ENCODER_VOLUME:
                     tap_code(clockwise ? KC_VOLU : KC_VOLD);
                     break;
@@ -40,7 +160,7 @@ bool encoder_update_kb(uint8_t index, bool clockwise) {
             break;
 
         case 1:
-            switch (right_cur_mode) {
+            switch (enc_mode) {
 #    ifdef POINTING_DEVICE_ENABLE
                 case ENCODER_DEFAULT_DPI:
                     spleeb_cycle_pointer_default_dpi(clockwise);
@@ -79,44 +199,6 @@ bool encoder_update_kb(uint8_t index, bool clockwise) {
 #    ifndef SPLEEB_DRAGSCROLL_DIVISOR
 #        define SPLEEB_DRAGSCROLL_DIVISOR 64
 #    endif // !SPLEEB_DRAGSCROLL_DIVISOR
-
-typedef union {
-    uint8_t raw;
-    struct {
-        uint8_t pointer_default_dpi : 4; // 16 steps available.
-        uint8_t pointer_sniping_dpi : 2; // 4 steps available.
-        bool    is_dragscroll_enabled : 1;
-        bool    is_sniping_enabled : 1;
-    } __attribute__((packed));
-} spleeb_config_t;
-
-static spleeb_config_t g_spleeb_config = {0};
-
-/**
- * \brief Set the value of `config` from EEPROM.
- *
- * Note that `is_dragscroll_enabled` and `is_sniping_enabled` are purposefully
- * ignored since we do not want to persist this state to memory.  In practice,
- * this state is always written to maximize write-performances.  Therefore, we
- * explicitly set them to `false` in this function.
- */
-static void read_spleeb_config_from_eeprom(spleeb_config_t* config) {
-    config->raw                   = eeconfig_read_kb() & 0xff;
-    config->is_dragscroll_enabled = false;
-    config->is_sniping_enabled    = false;
-}
-
-/**
- * \brief Save the value of `config` to eeprom.
- *
- * Note that all values are written verbatim, including whether drag-scroll
- * and/or sniper mode are enabled.  `read_spleeb_config_from_eeprom(…)`
- * resets these 2 values to `false` since it does not make sense to persist
- * these across reboots of the board.
- */
-static void write_spleeb_config_to_eeprom(spleeb_config_t* config) {
-    eeconfig_update_kb(config->raw);
-}
 
 /** \brief Return the current value of the pointer's default DPI. */
 static uint16_t get_pointer_default_dpi(spleeb_config_t* config) {
@@ -279,7 +361,7 @@ report_mouse_t pointing_device_task_kb(report_mouse_t mouse_report) {
 static void debug_spleeb_config_to_console(spleeb_config_t* config) {
 #    ifdef CONSOLE_ENABLE
     dprintf("(spleeb) process_record_kb: config = {\n"
-            "\traw = 0x%X,\n"
+            "\traw = 0x%lu,\n"
             "\t{\n"
             "\t\tis_dragscroll_enabled=%u\n"
             "\t\tis_sniping_enabled=%u\n"
@@ -345,12 +427,12 @@ bool process_record_kb(uint16_t keycode, keyrecord_t* record) {
     switch (keycode) {
         case ENC_MODE_LEFT_TOGGLE:
             if (record->event.pressed) {
-                left_cur_mode = (left_cur_mode + 1) % _NUM_L_MODES;
+                step_spleeb_left_enc(&g_spleeb_config);
             }
             break;
         case ENC_MODE_RIGHT_TOGGLE:
             if (record->event.pressed) {
-                right_cur_mode = (right_cur_mode + 1) % _NUM_R_MODES;
+                step_spleeb_right_enc(&g_spleeb_config);
             }
             break;
     }
@@ -379,116 +461,75 @@ bool is_mouse_record_kb(uint16_t keycode, keyrecord_t* record) {
     return is_mouse_record_user(keycode, record);
 }
 
-void eeconfig_init_kb(void) {
-    g_spleeb_config.raw                 = 0;
-    g_spleeb_config.pointer_default_dpi = 4;
-    write_spleeb_config_to_eeprom(&g_spleeb_config);
-    maybe_update_pointing_device_cpi(&g_spleeb_config);
-    eeconfig_init_user();
-}
-
-void matrix_init_kb(void) {
-    read_spleeb_config_from_eeprom(&g_spleeb_config);
-    matrix_init_user();
-}
-
-void spleeb_config_sync_handler(uint8_t initiator2target_buffer_size, const void* initiator2target_buffer, uint8_t target2initiator_buffer_size, void* target2initiator_buffer) {
-    if (initiator2target_buffer_size == sizeof(g_spleeb_config)) {
-        memcpy(&g_spleeb_config, initiator2target_buffer, sizeof(g_spleeb_config));
-    }
-}
-
-void keyboard_post_init_kb(void) {
-    transaction_register_rpc(RPC_ID_KB_CONFIG_SYNC, spleeb_config_sync_handler);
-    keyboard_post_init_user();
-}
-
-void housekeeping_task_kb(void) {
-    if (is_keyboard_master()) {
-        // Keep track of the last state, so that we can tell if we need to propagate to slave.
-        static spleeb_config_t last_spleeb_config = {0};
-        static uint32_t        last_sync          = 0;
-        bool                   needs_sync         = false;
-
-        // Check if the state values are different.
-        if (memcmp(&g_spleeb_config, &last_spleeb_config, sizeof(g_spleeb_config))) {
-            needs_sync = true;
-            memcpy(&last_spleeb_config, &g_spleeb_config, sizeof(g_spleeb_config));
-        }
-        // Send to slave every 500ms regardless of state change.
-        if (timer_elapsed32(last_sync) > 500) {
-            needs_sync = true;
-        }
-
-        // Perform the sync if requested.
-        if (needs_sync) {
-            if (transaction_rpc_send(RPC_ID_KB_CONFIG_SYNC, sizeof(g_spleeb_config), &g_spleeb_config)) {
-                last_sync = timer_read32();
-            }
-        }
-    }
-    // No need to invoke the user-specific callback, as it's been called
-    // already.
-}
-
 #endif // POINTING_DEVICE_ENABLE
 
 #ifdef OLED_ENABLE
 
 static void render_status(void) {
-    oled_set_cursor(0, 1);
     oled_write_P(PSTR("LAYER: "), false);
 
     switch (get_highest_layer(layer_state)) {
         case 0:
-            oled_write_P(PSTR("\xC0\xC1"), false);
+            oled_write_ln_P(PSTR("\xC0\xC1"), false);
             break;
         case 1:
-            oled_write_P(PSTR("\xC2\xC3"), false);
+            oled_write_ln_P(PSTR("\xC2\xC3"), false);
             break;
         case 2:
-            oled_write_P(PSTR("\xC4\xC5"), false);
+            oled_write_ln_P(PSTR("\xC4\xC5"), false);
             break;
         case 3:
-            oled_write_P(PSTR("\xC6\xC7"), false);
+            oled_write_ln_P(PSTR("\xC6\xC7"), false);
             break;
         case 4:
-            oled_write_P(PSTR("\xC8\xC9"), false);
+            oled_write_ln_P(PSTR("\xC8\xC9"), false);
             break;
         case 5:
-            oled_write_P(PSTR("\xCA\xCB"), false);
+            oled_write_ln_P(PSTR("\xCA\xCB"), false);
             break;
         default:
             // Or use the write_ln shortcut over adding '\n' to the end of your string
             oled_write_char(get_highest_layer(layer_state) + 0x30, true);
     }
 
-    oled_set_cursor(0, 3);
+    oled_write_ln_P("", false);
 
     uint8_t modifiers = get_mods();
     led_t   led_state = host_keyboard_led_state();
-    oled_write_P(PSTR("MODS:"), false);
-    oled_set_cursor(0, 5);
+    oled_write_ln_P(PSTR("MODS:"), false);
+
+    oled_write_ln_P("", false);
+
     oled_write_P(PSTR("\325\326"), (modifiers & MOD_MASK_SHIFT));
     oled_write_P(PSTR("\327\330"), (modifiers & MOD_MASK_CTRL));
     oled_write_P(PSTR("\331\332"), (modifiers & MOD_MASK_ALT));
-    oled_write_P(PSTR("\333\334"), (modifiers & MOD_MASK_GUI));
-    oled_set_cursor(0, 7);
-    oled_write_P(PSTR("LOCK:"), false);
-    oled_set_cursor(0, 9);
+    oled_write_ln_P(PSTR("\333\334"), (modifiers & MOD_MASK_GUI));
+
+    oled_write_ln_P("", false);
+
+    oled_write_P(PSTR("LOCK: "), false);
     oled_write_P(PSTR("\235\236"), led_state.caps_lock);
-    oled_write_P(PSTR("\275\276"), led_state.num_lock);
-    oled_set_cursor(0, 11);
+    oled_write_ln_P(PSTR("\275\276"), led_state.num_lock);
 
 #    ifdef POINTING_DEVICE_ENABLE
+    oled_write_ln_P(PSTR("POINTER:"), false);
 
-    oled_write_P(PSTR("POINTER:"), false);
-    oled_set_cursor(0, 13);
+    oled_write_ln_P("", false);
 
     oled_write_P(PSTR("dpi:"), false);
-    oled_write(get_u16_str(get_pointer_current_dpi(&g_spleeb_config), ' '), false);
-
+    oled_write_ln_P(get_u16_str(get_pointer_current_dpi(&g_spleeb_config), ' '), false);
 #    endif // POINTING_DEVICE_ENABLE
+
+    oled_write_ln_P("", false);
+    oled_write_ln_P(PSTR("ENCODER:"), false);
+
+#    ifdef ENCODER_ENABLE
+    oled_write_ln_P("", false);
+    oled_write_P(PSTR("R: "), false);
+    oled_write_P(get_encoder_mode_str(g_spleeb_config.enc_modes[1]), false);
+    oled_write_P(PSTR("L: "), false);
+    oled_write_ln_P(get_encoder_mode_str(g_spleeb_config.enc_modes[0]), false);
+#    endif // ENCODER_ENABLE
 }
 
 oled_rotation_t oled_init_kb(oled_rotation_t rotation) {
